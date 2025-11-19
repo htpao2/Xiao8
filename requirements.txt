@@ -1254,6 +1254,7 @@ websockets==15.0.1
     #   google-genai
     #   gui-agents
     #   xiao8
+whisper-cpp-python
 wsproto==1.2.0
     # via trio-websocket
 yarl==1.20.1

@@ -26,7 +26,7 @@ import requests
 import httpx
 import pathlib, wave
 from openai import AsyncOpenAI
-from config import MAIN_SERVER_PORT, MONITOR_SERVER_PORT, MEMORY_SERVER_PORT, MODELS_WITH_EXTRA_BODY, TOOL_SERVER_PORT
+from config import MAIN_SERVER_PORT, MONITOR_SERVER_PORT, MODELS_WITH_EXTRA_BODY, TOOL_SERVER_PORT
 from config.prompts_sys import emotion_analysis_prompt, proactive_chat_prompt
 import glob
 from utils.config_manager import get_config_manager
@@ -71,16 +71,12 @@ master_basic_config = None
 lanlan_basic_config = None
 name_mapping = None
 lanlan_prompt = None
-semantic_store = None
-time_store = None
-setting_store = None
-recent_log = None
 catgirl_names = []
 
 async def initialize_character_data():
     """初始化或重新加载角色配置数据"""
     global master_name, her_name, master_basic_config, lanlan_basic_config
-    global name_mapping, lanlan_prompt, semantic_store, time_store, setting_store, recent_log
+    global name_mapping, lanlan_prompt
     global catgirl_names, sync_message_queue, sync_shutdown_event, session_manager, session_id, sync_process, websocket_locks
     
     logger.info("正在加载角色配置...")
@@ -89,7 +85,7 @@ async def initialize_character_data():
     _config_manager.cleanup_invalid_voice_ids()
     
     # 加载最新的角色数据
-    master_name, her_name, master_basic_config, lanlan_basic_config, name_mapping, lanlan_prompt, semantic_store, time_store, setting_store, recent_log = _config_manager.get_character_data()
+    master_name, her_name, master_basic_config, lanlan_basic_config, name_mapping, lanlan_prompt = _config_manager.get_character_data()
     catgirl_names = list(lanlan_prompt.keys())
     
     # 为新增的角色初始化资源
@@ -288,39 +284,6 @@ async def set_preferred_model(request: Request):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-@app.get("/api/config/page_config")
-async def get_page_config(lanlan_name: str = ""):
-    """获取页面配置（lanlan_name 和 model_path）"""
-    try:
-        # 获取角色数据
-        _, her_name, _, lanlan_basic_config, _, _, _, _, _, _ = _config_manager.get_character_data()
-        
-        # 如果提供了 lanlan_name 参数，使用它；否则使用当前角色
-        target_name = lanlan_name if lanlan_name else her_name
-        
-        # 获取 live2d 字段
-        live2d = lanlan_basic_config.get(target_name, {}).get('live2d', 'mao_pro')
-        
-        # 查找所有模型
-        models = find_models()
-        
-        # 根据 live2d 字段查找对应的 model path
-        model_path = next((m["path"] for m in models if m["name"] == live2d), find_model_config_file(live2d))
-        
-        return {
-            "success": True,
-            "lanlan_name": target_name,
-            "model_path": model_path
-        }
-    except Exception as e:
-        logger.error(f"获取页面配置失败: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "lanlan_name": "",
-            "model_path": ""
-        }
-
 @app.get("/api/config/core_api")
 async def get_core_config_api():
     """获取核心配置（API Key）"""
@@ -332,23 +295,12 @@ async def get_core_config_api():
             core_config_path = str(config_manager.get_config_path('core_config.json'))
             with open(core_config_path, 'r', encoding='utf-8') as f:
                 core_cfg = json.load(f)
-                api_key = core_cfg.get('coreApiKey', '')
         except FileNotFoundError:
             # 如果文件不存在，返回当前配置中的CORE_API_KEY
             core_config = _config_manager.get_core_config()
-            api_key = core_config['CORE_API_KEY']
         
         return {
-            "api_key": api_key,
-            "coreApi": core_cfg.get('coreApi', 'qwen'),
-            "assistApi": core_cfg.get('assistApi', 'qwen'),
-            "assistApiKeyQwen": core_cfg.get('assistApiKeyQwen', ''),
-            "assistApiKeyOpenai": core_cfg.get('assistApiKeyOpenai', ''),
-            "assistApiKeyGlm": core_cfg.get('assistApiKeyGlm', ''),
-            "assistApiKeyStep": core_cfg.get('assistApiKeyStep', ''),
-            "assistApiKeySilicon": core_cfg.get('assistApiKeySilicon', ''),
-            "mcpToken": core_cfg.get('mcpToken', ''),  # 添加mcpToken字段
-            "enableCustomApi": core_cfg.get('enableCustomApi', False),  # 添加enableCustomApi字段
+            "vcp_url": core_cfg.get('vcp_url', 'http://127.0.0.1:6005/v1/chat/completions'),
             "success": True
         }
     except Exception as e:
@@ -596,19 +548,6 @@ async def shutdown_event():
             if sync_process[k].is_alive():
                 sync_process[k].terminate()  # 如果超时，强制终止
     logger.info("同步连接器进程已停止")
-    
-    # 向memory_server发送关闭信号
-    try:
-        import requests
-        from config import MEMORY_SERVER_PORT
-        shutdown_url = f"http://localhost:{MEMORY_SERVER_PORT}/shutdown"
-        response = requests.post(shutdown_url, timeout=2)
-        if response.status_code == 200:
-            logger.info("已向memory_server发送关闭信号")
-        else:
-            logger.warning(f"向memory_server发送关闭信号失败，状态码: {response.status_code}")
-    except Exception as e:
-        logger.warning(f"向memory_server发送关闭信号时出错: {e}")
 
 
 @app.websocket("/ws/{lanlan_name}")
@@ -705,202 +644,6 @@ async def notify_task_result(request: Request):
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-@app.post('/api/proactive_chat')
-async def proactive_chat(request: Request):
-    """主动搭话：爬取热门内容，让AI决定是否主动发起对话"""
-    try:
-        from utils.web_scraper import fetch_trending_content, format_trending_content
-        
-        # 获取当前角色数据
-        master_name_current, her_name_current, _, _, _, _, _, _, _, _ = _config_manager.get_character_data()
-        
-        data = await request.json()
-        lanlan_name = data.get('lanlan_name') or her_name_current
-        
-        # 获取session manager
-        mgr = session_manager.get(lanlan_name)
-        if not mgr:
-            return JSONResponse({"success": False, "error": f"角色 {lanlan_name} 不存在"}, status_code=404)
-        
-        # 检查是否正在响应中（如果正在说话，不打断）
-        if mgr.is_active and hasattr(mgr.session, '_is_responding') and mgr.session._is_responding:
-            return JSONResponse({
-                "success": False, 
-                "error": "AI正在响应中，无法主动搭话",
-                "message": "请等待当前响应完成"
-            }, status_code=409)
-        
-        logger.info(f"[{lanlan_name}] 开始主动搭话流程...")
-        
-        # 1. 爬取热门内容
-        try:
-            trending_content = await fetch_trending_content(bilibili_limit=10, weibo_limit=10)
-            
-            if not trending_content['success']:
-                return JSONResponse({
-                    "success": False,
-                    "error": "无法获取热门内容",
-                    "detail": trending_content.get('error', '未知错误')
-                }, status_code=500)
-            
-            formatted_content = format_trending_content(trending_content)
-            logger.info(f"[{lanlan_name}] 成功获取热门内容")
-            
-        except Exception as e:
-            logger.error(f"[{lanlan_name}] 获取热门内容失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": "爬取热门内容时出错",
-                "detail": str(e)
-            }, status_code=500)
-        
-        # 2. 获取new_dialogue prompt
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"http://localhost:{MEMORY_SERVER_PORT}/new_dialog/{lanlan_name}", timeout=5.0)
-                memory_context = resp.text
-        except Exception as e:
-            logger.warning(f"[{lanlan_name}] 获取记忆上下文失败，使用空上下文: {e}")
-            memory_context = ""
-        
-        # 3. 构造提示词（使用prompts_sys中的模板）
-        system_prompt = proactive_chat_prompt.format(
-            lanlan_name=lanlan_name,
-            master_name=master_name_current,
-            trending_content=formatted_content,
-            memory_context=memory_context
-        )
-
-        # 4. 直接使用langchain ChatOpenAI获取AI回复（不创建临时session）
-        try:
-            core_config = _config_manager.get_core_config()
-            
-            # 直接使用langchain ChatOpenAI发送请求
-            from langchain_openai import ChatOpenAI
-            from langchain_core.messages import SystemMessage
-            
-            llm = ChatOpenAI(
-                model=core_config['CORRECTION_MODEL'],
-                base_url=core_config['OPENROUTER_URL'],
-                api_key=core_config['OPENROUTER_API_KEY'],
-                temperature=1.1,
-                streaming=False  # 不需要流式，直接获取完整响应
-            )
-            
-            # 发送请求获取AI决策
-            print(system_prompt)
-            response = await asyncio.wait_for(
-                llm.ainvoke([SystemMessage(content=system_prompt)]),
-                timeout=10.0
-            )
-            response_text = response.content.strip()
-            
-            logger.info(f"[{lanlan_name}] AI决策结果: {response_text[:100]}...")
-            
-            # 5. 判断AI是否选择搭话
-            if "[PASS]" in response_text or not response_text:
-                return JSONResponse({
-                    "success": True,
-                    "action": "pass",
-                    "message": "AI选择暂时不搭话"
-                })
-            
-            # 6. AI选择搭话，需要通过session manager处理
-            # 首先检查是否有真实的websocket连接
-            if not mgr.websocket:
-                return JSONResponse({
-                    "success": False,
-                    "error": "没有活跃的WebSocket连接，无法主动搭话。请先打开前端页面。"
-                }, status_code=400)
-            
-            # 检查websocket是否连接
-            try:
-                from starlette.websockets import WebSocketState
-                if hasattr(mgr.websocket, 'client_state'):
-                    if mgr.websocket.client_state != WebSocketState.CONNECTED:
-                        return JSONResponse({
-                            "success": False,
-                            "error": "WebSocket未连接，无法主动搭话"
-                        }, status_code=400)
-            except Exception as e:
-                logger.warning(f"检查WebSocket状态失败: {e}")
-            
-            # 检查是否有现有的session，如果没有则创建一个文本session
-            session_created = False
-            if not mgr.session or not hasattr(mgr.session, '_conversation_history'):
-                logger.info(f"[{lanlan_name}] 没有活跃session，创建文本session用于主动搭话")
-                # 使用现有的真实websocket启动session
-                await mgr.start_session(mgr.websocket, new=True, input_mode='text')
-                session_created = True
-                logger.info(f"[{lanlan_name}] 文本session已创建")
-            
-            # 如果是新创建的session，等待TTS准备好
-            if session_created and mgr.use_tts:
-                logger.info(f"[{lanlan_name}] 等待TTS准备...")
-                max_wait = 5  # 最多等待5秒
-                wait_step = 0.1
-                waited = 0
-                while waited < max_wait:
-                    async with mgr.tts_cache_lock:
-                        if mgr.tts_ready:
-                            logger.info(f"[{lanlan_name}] TTS已准备好")
-                            break
-                    await asyncio.sleep(wait_step)
-                    waited += wait_step
-                
-                if waited >= max_wait:
-                    logger.warning(f"[{lanlan_name}] TTS准备超时，继续发送（可能没有语音）")
-            
-            # 现在可以将AI的话添加到对话历史中
-            from langchain_core.messages import AIMessage
-            mgr.session._conversation_history.append(AIMessage(content=response_text))
-            logger.info(f"[{lanlan_name}] 已将主动搭话添加到对话历史")
-            
-            # 生成新的speech_id（用于TTS）
-            from uuid import uuid4
-            async with mgr.lock:
-                mgr.current_speech_id = str(uuid4())
-            
-            # 通过handle_text_data处理这段话（触发TTS和前端显示）
-            # 分chunk发送以模拟流式效果
-            chunks = [response_text[i:i+10] for i in range(0, len(response_text), 10)]
-            for i, chunk in enumerate(chunks):
-                await mgr.handle_text_data(chunk, is_first_chunk=(i == 0))
-                await asyncio.sleep(0.05)  # 小延迟模拟流式
-            
-            # 调用response完成回调
-            if hasattr(mgr, 'handle_response_complete'):
-                await mgr.handle_response_complete()
-            
-            return JSONResponse({
-                "success": True,
-                "action": "chat",
-                "message": "主动搭话已发送",
-                "lanlan_name": lanlan_name
-            })
-            
-        except asyncio.TimeoutError:
-            logger.error(f"[{lanlan_name}] AI回复超时")
-            return JSONResponse({
-                "success": False,
-                "error": "AI处理超时"
-            }, status_code=504)
-        except Exception as e:
-            logger.error(f"[{lanlan_name}] AI处理失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": "AI处理失败",
-                "detail": str(e)
-            }, status_code=500)
-        
-    except Exception as e:
-        logger.error(f"主动搭话接口异常: {e}")
-        return JSONResponse({
-            "success": False,
-            "error": "服务器内部错误",
-            "detail": str(e)
-        }, status_code=500)
 
 @app.get("/l2d", response_class=HTMLResponse)
 async def get_l2d_manager(request: Request):
@@ -1710,31 +1453,6 @@ async def delete_catgirl(name: str):
     if name == current_catgirl:
         return JSONResponse({'success': False, 'error': '不能删除当前正在使用的猫娘！请先切换到其他猫娘后再删除。'}, status_code=400)
     
-    # 删除对应的记忆文件
-    try:
-        memory_paths = [_config_manager.memory_dir, _config_manager.project_memory_dir]
-        files_to_delete = [
-            f'semantic_memory_{name}',  # 语义记忆目录
-            f'time_indexed_{name}',     # 时间索引数据库文件
-            f'settings_{name}.json',    # 设置文件
-            f'recent_{name}.json',      # 最近聊天记录文件
-        ]
-        
-        for base_dir in memory_paths:
-            for file_name in files_to_delete:
-                file_path = base_dir / file_name
-                if file_path.exists():
-                    try:
-                        if file_path.is_dir():
-                            shutil.rmtree(file_path)
-                        else:
-                            file_path.unlink()
-                        logger.info(f"已删除: {file_path}")
-                    except Exception as e:
-                        logger.warning(f"删除失败 {file_path}: {e}")
-    except Exception as e:
-        logger.error(f"删除记忆文件时出错: {e}")
-    
     # 删除角色配置
     del characters['猫娘'][name]
     _config_manager.save_characters(characters)
@@ -1763,19 +1481,6 @@ async def shutdown_server_async():
         # Give a small delay to allow the beacon response to be sent
         await asyncio.sleep(0.5)
         logger.info("正在关闭服务器...")
-        
-        # 向memory_server发送关闭信号
-        try:
-            import requests
-            from config import MEMORY_SERVER_PORT
-            shutdown_url = f"http://localhost:{MEMORY_SERVER_PORT}/shutdown"
-            response = requests.post(shutdown_url, timeout=1)
-            if response.status_code == 200:
-                logger.info("已向memory_server发送关闭信号")
-            else:
-                logger.warning(f"向memory_server发送关闭信号失败，状态码: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"向memory_server发送关闭信号时出错: {e}")
         
         # Signal the server to stop
         current_config = get_start_config()
@@ -1831,77 +1536,6 @@ async def unregister_voice(name: str):
         logger.error(f"解除声音注册时出错: {e}")
         return JSONResponse({'success': False, 'error': f'解除注册失败: {str(e)}'}, status_code=500)
 
-@app.get('/api/memory/recent_files')
-async def get_recent_files():
-    """获取 memory 目录下所有 recent*.json 文件名列表"""
-    from utils.config_manager import get_config_manager
-    cm = get_config_manager()
-    files = glob.glob(str(cm.memory_dir / 'recent*.json'))
-    file_names = [os.path.basename(f) for f in files]
-    return {"files": file_names}
-
-@app.get('/api/memory/review_config')
-async def get_review_config():
-    """获取记忆整理配置"""
-    try:
-        from utils.config_manager import get_config_manager
-        config_manager = get_config_manager()
-        config_path = str(config_manager.get_config_path('core_config.json'))
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-                # 如果配置中没有这个键，默认返回True（开启）
-                return {"enabled": config_data.get('recent_memory_auto_review', True)}
-        else:
-            # 如果配置文件不存在，默认返回True（开启）
-            return {"enabled": True}
-    except Exception as e:
-        logger.error(f"读取记忆整理配置失败: {e}")
-        return {"enabled": True}
-
-@app.post('/api/memory/review_config')
-async def update_review_config(request: Request):
-    """更新记忆整理配置"""
-    try:
-        data = await request.json()
-        enabled = data.get('enabled', True)
-        
-        from utils.config_manager import get_config_manager
-        config_manager = get_config_manager()
-        config_path = str(config_manager.get_config_path('core_config.json'))
-        config_data = {}
-        
-        # 读取现有配置
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-        
-        # 更新配置
-        config_data['recent_memory_auto_review'] = enabled
-        
-        # 保存配置
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"记忆整理配置已更新: enabled={enabled}")
-        return {"success": True, "enabled": enabled}
-    except Exception as e:
-        logger.error(f"更新记忆整理配置失败: {e}")
-        return {"success": False, "error": str(e)}
-
-@app.get('/api/memory/recent_file')
-async def get_recent_file(filename: str):
-    """获取指定 recent*.json 文件内容"""
-    from utils.config_manager import get_config_manager
-    cm = get_config_manager()
-    file_path = str(cm.memory_dir / filename)
-    if not (filename.startswith('recent') and filename.endswith('.json')):
-        return JSONResponse({"success": False, "error": "文件名不合法"}, status_code=400)
-    if not os.path.exists(file_path):
-        return JSONResponse({"success": False, "error": "文件不存在"}, status_code=404)
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    return {"content": content}
 
 @app.get("/api/live2d/model_config/{model_name}")
 async def get_model_config(model_name: str):
@@ -2283,40 +1917,6 @@ async def update_emotion_mapping(model_name: str, request: Request):
         logger.error(f"更新情绪映射配置失败: {e}")
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
-@app.post('/api/memory/recent_file/save')
-async def save_recent_file(request: Request):
-    import os, json
-    data = await request.json()
-    filename = data.get('filename')
-    chat = data.get('chat')
-    from utils.config_manager import get_config_manager
-    cm = get_config_manager()
-    file_path = str(cm.memory_dir / filename)
-    if not (filename and filename.startswith('recent') and filename.endswith('.json')):
-        return JSONResponse({"success": False, "error": "文件名不合法"}, status_code=400)
-    arr = []
-    for msg in chat:
-        t = msg.get('role')
-        text = msg.get('text', '')
-        arr.append({
-            "type": t,
-            "data": {
-                "content": text,
-                "additional_kwargs": {},
-                "response_metadata": {},
-                "type": t,
-                "name": None,
-                "id": None,
-                "example": False,
-                **({"tool_calls": [], "invalid_tool_calls": [], "usage_metadata": None} if t == "ai" else {})
-            }
-        })
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(arr, f, ensure_ascii=False, indent=2)
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 @app.post('/api/emotion/analysis')
 async def emotion_analysis(request: Request):
@@ -2415,9 +2015,6 @@ async def emotion_analysis(request: Request):
             "confidence": 0.0
         }
 
-@app.get('/memory_browser', response_class=HTMLResponse)
-async def memory_browser(request: Request):
-    return templates.TemplateResponse('templates/memory_browser.html', {"request": request})
 
 
 @app.get("/{lanlan_name}", response_class=HTMLResponse)
@@ -2426,182 +2023,6 @@ async def get_index(request: Request, lanlan_name: str):
     return templates.TemplateResponse("templates/index.html", {
         "request": request
     })
-
-@app.post('/api/agent/flags')
-async def update_agent_flags(request: Request):
-    """来自前端的Agent开关更新，级联到各自的session manager。"""
-    try:
-        data = await request.json()
-        _, her_name_current, _, _, _, _, _, _, _, _ = _config_manager.get_character_data()
-        lanlan = data.get('lanlan_name') or her_name_current
-        flags = data.get('flags') or {}
-        mgr = session_manager.get(lanlan)
-        if not mgr:
-            return JSONResponse({"success": False, "error": "lanlan not found"}, status_code=404)
-        # Update core flags first
-        mgr.update_agent_flags(flags)
-        # Forward to tool server for MCP/Computer-Use flags
-        try:
-            forward_payload = {}
-            if 'mcp_enabled' in flags:
-                forward_payload['mcp_enabled'] = bool(flags['mcp_enabled'])
-            if 'computer_use_enabled' in flags:
-                forward_payload['computer_use_enabled'] = bool(flags['computer_use_enabled'])
-            if forward_payload:
-                async with httpx.AsyncClient(timeout=0.7) as client:
-                    r = await client.post(f"http://localhost:{TOOL_SERVER_PORT}/agent/flags", json=forward_payload)
-                    if not r.is_success:
-                        raise Exception(f"tool_server responded {r.status_code}")
-        except Exception as e:
-            # On failure, reset flags in core to safe state
-            mgr.update_agent_flags({'agent_enabled': False, 'computer_use_enabled': False, 'mcp_enabled': False})
-            return JSONResponse({"success": False, "error": f"tool_server forward failed: {e}"}, status_code=502)
-        return {"success": True}
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-
-@app.get('/api/agent/health')
-async def agent_health():
-    """Check tool_server health via main_server proxy."""
-    try:
-        async with httpx.AsyncClient(timeout=0.7) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/health")
-            if not r.is_success:
-                return JSONResponse({"status": "down"}, status_code=502)
-            data = {}
-            try:
-                data = r.json()
-            except Exception:
-                pass
-            return {"status": "ok", **({"tool": data} if isinstance(data, dict) else {})}
-    except Exception:
-        return JSONResponse({"status": "down"}, status_code=502)
-
-
-@app.get('/api/agent/computer_use/availability')
-async def proxy_cu_availability():
-    try:
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/computer_use/availability")
-            if not r.is_success:
-                return JSONResponse({"ready": False, "reasons": [f"tool_server responded {r.status_code}"]}, status_code=502)
-            return r.json()
-    except Exception as e:
-        return JSONResponse({"ready": False, "reasons": [f"proxy error: {e}"]}, status_code=502)
-
-
-@app.get('/api/agent/mcp/availability')
-async def proxy_mcp_availability():
-    try:
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/mcp/availability")
-            if not r.is_success:
-                return JSONResponse({"ready": False, "reasons": [f"tool_server responded {r.status_code}"]}, status_code=502)
-            return r.json()
-    except Exception as e:
-        return JSONResponse({"ready": False, "reasons": [f"proxy error: {e}"]}, status_code=502)
-
-
-@app.get('/api/agent/tasks')
-async def proxy_tasks():
-    """Get all tasks from tool server via main_server proxy."""
-    try:
-        async with httpx.AsyncClient(timeout=2.5) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/tasks")
-            if not r.is_success:
-                return JSONResponse({"tasks": [], "error": f"tool_server responded {r.status_code}"}, status_code=502)
-            return r.json()
-    except Exception as e:
-        return JSONResponse({"tasks": [], "error": f"proxy error: {e}"}, status_code=502)
-
-
-@app.get('/api/agent/tasks/{task_id}')
-async def proxy_task_detail(task_id: str):
-    """Get specific task details from tool server via main_server proxy."""
-    try:
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/tasks/{task_id}")
-            if not r.is_success:
-                return JSONResponse({"error": f"tool_server responded {r.status_code}"}, status_code=502)
-            return r.json()
-    except Exception as e:
-        return JSONResponse({"error": f"proxy error: {e}"}, status_code=502)
-
-
-# Task status polling endpoint for frontend
-@app.get('/api/agent/task_status')
-async def get_task_status():
-    """Get current task status for frontend polling - returns all tasks with their current status."""
-    try:
-        # Get tasks from tool server using async client with increased timeout
-        async with httpx.AsyncClient(timeout=2.5) as client:
-            r = await client.get(f"http://localhost:{TOOL_SERVER_PORT}/tasks")
-            if not r.is_success:
-                return JSONResponse({"tasks": [], "error": f"tool_server responded {r.status_code}"}, status_code=502)
-            
-            tasks_data = r.json()
-            tasks = tasks_data.get("tasks", [])
-            debug_info = tasks_data.get("debug", {})
-            
-            # Enhance task data with additional information if needed
-            enhanced_tasks = []
-            for task in tasks:
-                enhanced_task = {
-                    "id": task.get("id"),
-                    "status": task.get("status", "unknown"),
-                    "type": task.get("type", "unknown"),
-                    "lanlan_name": task.get("lanlan_name"),
-                    "start_time": task.get("start_time"),
-                    "end_time": task.get("end_time"),
-                    "params": task.get("params", {}),
-                    "result": task.get("result"),
-                    "error": task.get("error"),
-                    "source": task.get("source", "unknown")  # 添加来源信息
-                }
-                enhanced_tasks.append(enhanced_task)
-            
-            return {
-                "success": True,
-                "tasks": enhanced_tasks,
-                "total_count": len(enhanced_tasks),
-                "running_count": len([t for t in enhanced_tasks if t.get("status") == "running"]),
-                "queued_count": len([t for t in enhanced_tasks if t.get("status") == "queued"]),
-                "completed_count": len([t for t in enhanced_tasks if t.get("status") == "completed"]),
-                "failed_count": len([t for t in enhanced_tasks if t.get("status") == "failed"]),
-                "timestamp": datetime.now().isoformat(),
-                "debug": debug_info  # 传递调试信息到前端
-            }
-        
-    except Exception as e:
-        return JSONResponse({
-            "success": False,
-            "tasks": [],
-            "error": f"Failed to fetch task status: {str(e)}",
-            "timestamp": datetime.now().isoformat()
-        }, status_code=500)
-
-
-@app.post('/api/agent/admin/control')
-async def proxy_admin_control(payload):
-    """Proxy admin control commands to tool server."""
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.post(f"http://localhost:{TOOL_SERVER_PORT}/admin/control", json=payload)
-            if not r.is_success:
-                return JSONResponse({"success": False, "error": f"tool_server responded {r.status_code}"}, status_code=502)
-            
-            result = r.json()
-            logger.info(f"Admin control result: {result}")
-            return result
-        
-    except Exception as e:
-        return JSONResponse({
-            "success": False,
-            "error": f"Failed to execute admin control: {str(e)}"
-        }, status_code=500)
-
 
 # --- Run the Server ---
 if __name__ == "__main__":

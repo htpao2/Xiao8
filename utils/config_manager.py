@@ -42,10 +42,8 @@ class ConfigManager:
         self.docs_dir = self._get_documents_directory()
         self.app_docs_dir = self.docs_dir / self.app_name
         self.config_dir = self.app_docs_dir / "config"
-        self.memory_dir = self.app_docs_dir / "memory"
         self.live2d_dir = self.app_docs_dir / "live2d"
         self.project_config_dir = self._get_project_config_directory()
-        self.project_memory_dir = self._get_project_memory_directory()
     
     def _get_documents_directory(self):
         """获取用户文档目录（使用系统API）"""
@@ -200,24 +198,6 @@ class ConfigManager:
         
         return app_dir / "config"
     
-    def _get_project_memory_directory(self):
-        """获取项目的memory/store目录"""
-        if getattr(sys, 'frozen', False):
-            # 如果是打包后的exe（PyInstaller）
-            # 单文件模式：数据文件在 _MEIPASS 临时目录
-            # 多文件模式：数据文件在 exe 同目录
-            if hasattr(sys, '_MEIPASS'):
-                # 单文件模式：使用临时解压目录
-                app_dir = Path(sys._MEIPASS)
-            else:
-                # 多文件模式：使用 exe 同目录
-                app_dir = Path(sys.executable).parent
-        else:
-            # 如果是脚本运行
-            app_dir = Path.cwd()
-        
-        return app_dir / "memory" / "store"
-    
     def _ensure_app_docs_directory(self):
         """确保应用文档目录存在（Xiao8目录本身）"""
         try:
@@ -265,19 +245,6 @@ class ConfigManager:
             return True
         except Exception as e:
             print(f"Warning: Failed to create config directory: {e}", file=sys.stderr)
-            return False
-    
-    def ensure_memory_directory(self):
-        """确保我的文档下的memory目录存在"""
-        try:
-            # 先确保app_docs_dir存在
-            if not self._ensure_app_docs_directory():
-                return False
-            
-            self.memory_dir.mkdir(exist_ok=True)
-            return True
-        except Exception as e:
-            print(f"Warning: Failed to create memory directory: {e}", file=sys.stderr)
             return False
     
     def ensure_live2d_directory(self):
@@ -362,42 +329,6 @@ class ConfigManager:
                     print(f"[ConfigManager] ~ Using in-memory default for {filename}")
                 else:
                     print(f"[ConfigManager] ✗ Source config not found: {project_config_path}")
-    
-    def migrate_memory_files(self):
-        """
-        迁移记忆文件到我的文档
-        
-        策略：
-        1. 检查我的文档下的memory文件夹，没有就创建
-        2. 迁移所有记忆文件和目录
-        """
-        # 确保目录存在
-        if not self.ensure_memory_directory():
-            print(f"Warning: Cannot create memory directory, using project memory", file=sys.stderr)
-            return
-        
-        # 如果项目memory/store目录不存在，跳过
-        if not self.project_memory_dir.exists():
-            return
-        
-        # 迁移所有记忆文件
-        try:
-            for item in self.project_memory_dir.iterdir():
-                dest_path = self.memory_dir / item.name
-                
-                # 如果目标已存在，跳过
-                if dest_path.exists():
-                    continue
-                
-                # 复制文件或目录
-                if item.is_file():
-                    shutil.copy2(item, dest_path)
-                    print(f"Migrated memory file: {item.name}")
-                elif item.is_dir():
-                    shutil.copytree(item, dest_path)
-                    print(f"Migrated memory directory: {item.name}")
-        except Exception as e:
-            print(f"Warning: Failed to migrate memory files: {e}", file=sys.stderr)
     
     # --- Character configuration helpers ---
 
@@ -545,12 +476,6 @@ class ConfigManager:
             prompt_value = catgirl_data.get(name, {}).get('system_prompt', lanlan_prompt)
             lanlan_prompt_map[name] = prompt_value
 
-        memory_base = str(self.memory_dir)
-        semantic_store = {name: f'{memory_base}/semantic_memory_{name}' for name in catgirl_names}
-        time_store = {name: f'{memory_base}/time_indexed_{name}' for name in catgirl_names}
-        setting_store = {name: f'{memory_base}/settings_{name}.json' for name in catgirl_names}
-        recent_log = {name: f'{memory_base}/recent_{name}.json' for name in catgirl_names}
-
         return (
             master_name,
             her_name,
@@ -558,10 +483,6 @@ class ConfigManager:
             catgirl_data,
             name_mapping,
             lanlan_prompt_map,
-            semantic_store,
-            time_store,
-            setting_store,
-            recent_log,
         )
 
     # --- Core config helpers ---
@@ -773,43 +694,14 @@ class ConfigManager:
             print(f"Error saving {filename}: {e}", file=sys.stderr)
             raise
     
-    def get_memory_path(self, filename):
-        """
-        获取记忆文件路径
-        
-        优先级：
-        1. 我的文档/{APP_NAME}/memory/
-        2. 项目目录/memory/store/
-        
-        Args:
-            filename: 记忆文件名
-            
-        Returns:
-            Path: 记忆文件路径
-        """
-        # 首选：我的文档下的记忆
-        docs_memory_path = self.memory_dir / filename
-        if docs_memory_path.exists():
-            return docs_memory_path
-        
-        # 备选：项目目录下的记忆
-        project_memory_path = self.project_memory_dir / filename
-        if project_memory_path.exists():
-            return project_memory_path
-        
-        # 都不存在，返回我的文档路径（用于创建新文件）
-        return docs_memory_path
-    
     def get_config_info(self):
         """获取配置目录信息"""
         return {
             "documents_dir": str(self.docs_dir),
             "app_dir": str(self.app_docs_dir),
             "config_dir": str(self.config_dir),
-            "memory_dir": str(self.memory_dir),
             "live2d_dir": str(self.live2d_dir),
             "project_config_dir": str(self.project_config_dir),
-            "project_memory_dir": str(self.project_memory_dir),
             "config_files": {
                 filename: str(self.get_config_path(filename))
                 for filename in CONFIG_FILES
@@ -828,7 +720,6 @@ def get_config_manager(app_name=None):
         _config_manager = ConfigManager(app_name)
         # 初始化时自动迁移配置文件和记忆文件
         _config_manager.migrate_config_files()
-        _config_manager.migrate_memory_files()
     return _config_manager
 
 
