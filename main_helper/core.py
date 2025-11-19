@@ -17,20 +17,19 @@ from fastapi import WebSocket, WebSocketDisconnect
 from utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, \
     is_only_punctuation, split_paragraph
 from utils.audio import make_wav_header
-from main_helper.omni_realtime_client import OmniRealtimeClient
 from main_helper.omni_offline_client import OmniOfflineClient
 from main_helper.tts_helper import get_tts_worker
 import inflect
 import base64
 from io import BytesIO
 from PIL import Image
-from config import MEMORY_SERVER_PORT
 from utils.config_manager import get_config_manager
 from multiprocessing import Process, Queue as MPQueue
 from uuid import uuid4
 import numpy as np
 from librosa import resample
 import httpx 
+from utils.stt import transcribe_audio
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
@@ -75,26 +74,23 @@ class LLMSessionManager:
             self.lanlan_basic_config,
             self.name_mapping,
             self.lanlan_prompt_map,
-            self.semantic_store,
-            self.time_store,
-            self.setting_store,
-            self.recent_log
+        _,
+        _,
+        _,
+        _
         ) = self._config_manager.get_character_data()
         # 获取API相关配置（动态读取以支持热重载）
         core_config = self._config_manager.get_core_config()
         self.model = core_config['CORE_MODEL']  # For realtime voice
         self.text_model = core_config['CORRECTION_MODEL']  # For text-only mode
         self.vision_model = core_config['VISION_MODEL']  # For vision tasks
-        self.core_url = core_config['CORE_URL']
+        self.vcp_url = core_config['VCP_URL']
         self.core_api_key = core_config['CORE_API_KEY']
-        self.core_api_type = core_config['CORE_API_TYPE']
-        self.openrouter_url = core_config['OPENROUTER_URL']
         self.openrouter_api_key = core_config['OPENROUTER_API_KEY']
-        self.memory_server_port = MEMORY_SERVER_PORT
         self.audio_api_key = core_config['AUDIO_API_KEY']
         self.voice_id = self.lanlan_basic_config[self.lanlan_name].get('voice_id', '')
         # 注意：use_tts 会在 start_session 中根据 input_mode 重新设置
-        self.use_tts = False
+        self.use_tts = True
         self.generation_config = {}  # Qwen暂时不用
         self.message_cache_for_new_session = []
         self.is_preparing_new_session = False
@@ -291,18 +287,16 @@ class LLMSessionManager:
         # 推送到同步消息队列
         self.sync_message_queue.put({"type": "user", "data": {"input_type": "transcript", "data": transcript.strip()}})
         
-        # 只在语音模式（OmniRealtimeClient）下发送到前端显示用户转录
         # 文本模式下前端会自己显示，无需后端发送，避免重复
-        if isinstance(self.session, OmniRealtimeClient):
-            if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
-                try:
-                    message = {
-                        "type": "user_transcript",
-                        "text": transcript.strip()
-                    }
-                    await self.websocket.send_json(message)
-                except Exception as e:
-                    logger.error(f"⚠️ 发送用户转录到前端失败: {e}")
+        if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
+            try:
+                message = {
+                    "type": "user_transcript",
+                    "text": transcript.strip()
+                }
+                await self.websocket.send_json(message)
+            except Exception as e:
+                logger.error(f"⚠️ 发送用户转录到前端失败: {e}")
         
         # 缓存到session cache
         if hasattr(self, 'is_preparing_new_session') and self.is_preparing_new_session:
@@ -499,13 +493,10 @@ class LLMSessionManager:
         self.model = core_config['CORE_MODEL']
         self.text_model = core_config['CORRECTION_MODEL']
         self.vision_model = core_config['VISION_MODEL']
-        self.core_url = core_config['CORE_URL']
+        self.vcp_url = core_config['VCP_URL']
         self.core_api_key = core_config['CORE_API_KEY']
-        self.core_api_type = core_config['CORE_API_TYPE']
-        self.openrouter_url = core_config['OPENROUTER_URL']
         self.openrouter_api_key = core_config['OPENROUTER_API_KEY']
         self.audio_api_key = core_config['AUDIO_API_KEY']
-        logger.info(f"📌 已重新加载配置: core_api={self.core_api_type}, model={self.model}, text_model={self.text_model}, vision_model={self.vision_model}")
         
         # 重置TTS缓存状态
         async with self.tts_cache_lock:
@@ -518,15 +509,7 @@ class LLMSessionManager:
             # 注意：不清空 pending_input_data，因为可能已有数据在缓存中
         
         # 根据 input_mode 设置 use_tts
-        if input_mode == 'text':
-            # 文本模式总是需要 TTS（使用默认或自定义音色）
-            self.use_tts = True
-        elif self.voice_id:
-            # 语音模式下有自定义音色时使用 TTS
-            self.use_tts = True
-        else:
-            # 语音模式下无自定义音色，使用 realtime API 原生语音
-            self.use_tts = False
+        self.use_tts = True
         
         async with self.lock:
             if self.is_active:
@@ -564,8 +547,9 @@ class LLMSessionManager:
             if self.tts_process is None or not self.tts_process.is_alive():
                 # 使用工厂函数获取合适的 TTS worker
                 has_custom_voice = bool(self.voice_id)
+                core_api_type = self._config_manager.get_core_config().get('coreApi', 'qwen')
                 tts_worker = get_tts_worker(
-                    core_api_type=self.core_api_type,
+                    core_api_type=core_api_type,
                     has_custom_voice=has_custom_voice
                 )
                 
@@ -579,7 +563,7 @@ class LLMSessionManager:
                 self.tts_process.start()
                 
                 # 等待TTS进程发送就绪信号（最多等待8秒）
-                tts_type = "自定义音色(CosyVoice)" if has_custom_voice else f"{self.core_api_type}默认TTS"
+                tts_type = "自定义音色(CosyVoice)" if has_custom_voice else f"{core_api_type}默认TTS"
                 logger.info(f"🎤 TTS进程已启动，等待就绪... (使用: {tts_type})")
                 
                 tts_ready = False
@@ -639,44 +623,25 @@ class LLMSessionManager:
             """异步创建并连接 LLM Session"""
             # 获取初始 prompt
             initial_prompt = (f"你是一个角色扮演大师，并且精通电脑操作。请按要求扮演以下角色（{self.lanlan_name}），并在对方请求时、回答'我试试'并尝试操纵电脑。" if self._is_agent_enabled() else f"你是一个角色扮演大师。请按要求扮演以下角色（{self.lanlan_name}）。") + self.lanlan_prompt
-            initial_prompt += requests.get(f"http://localhost:{self.memory_server_port}/new_dialog/{self.lanlan_name}").text
             
             logger.info(f"🤖 开始创建 LLM Session (input_mode={input_mode})")
             
-            # 根据input_mode创建不同的session
-            if input_mode == 'text':
-                # 文本模式：使用 OmniOfflineClient with OpenAI-compatible API
-                self.session = OmniOfflineClient(
-                    base_url=self.openrouter_url,
-                    api_key=self.openrouter_api_key,
-                    model=self.text_model,
-                    vision_model=self.vision_model,
-                    on_text_delta=self.handle_text_data,
-                    on_input_transcript=self.handle_input_transcript,
-                    on_output_transcript=self.handle_output_transcript,
-                    on_connection_error=self.handle_connection_error,
-                    on_response_done=self.handle_response_complete
-                )
-            else:
-                # 语音模式：使用 OmniRealtimeClient
-                self.session = OmniRealtimeClient(
-                    base_url=self.core_url,
-                    api_key=self.core_api_key,
-                    model=self.model,
-                    on_text_delta=self.handle_text_data,
-                    on_audio_delta=self.handle_audio_data,
-                    on_new_message=self.handle_new_message,
-                    on_input_transcript=self.handle_input_transcript,
-                    on_output_transcript=self.handle_output_transcript,
-                    on_connection_error=self.handle_connection_error,
-                    on_response_done=self.handle_response_complete,
-                    on_silence_timeout=self.handle_silence_timeout,
-                    api_type=self.core_api_type  # 传入API类型，用于判断是否启用静默超时
-                )
+            # 文本模式：使用 OmniOfflineClient with OpenAI-compatible API
+            self.session = OmniOfflineClient(
+                base_url=self.vcp_url,
+                api_key=self.openrouter_api_key,
+                model=self.text_model,
+                vision_model=self.vision_model,
+                on_text_delta=self.handle_text_data,
+                on_input_transcript=self.handle_input_transcript,
+                on_output_transcript=self.handle_output_transcript,
+                on_connection_error=self.handle_connection_error,
+                on_response_done=self.handle_response_complete
+            )
 
             # 连接 session
             if self.session:
-                await self.session.connect(initial_prompt, native_audio = not self.use_tts)
+                await self.session.connect(initial_prompt)
                 logger.info(f"✅ LLM Session 已连接")
                 return True
             else:
@@ -722,38 +687,8 @@ class LLMSessionManager:
                 # 启动消息处理任务
                 self.message_handler_task = asyncio.create_task(self.session.handle_messages())
                 
-                # 🔥 预热逻辑：对于语音模式，立即触发一次 skipped response 来 prefill instructions
-                # 这样可以大幅减少首轮对话的延迟（让 API 提前处理并缓存 instructions 的 KV cache）
-                if isinstance(self.session, OmniRealtimeClient):
-                    try:
-                        logger.info(f"🔥 开始预热 Session，prefill instructions...")
-                        warmup_start = time.time()
-                        
-                        # 创建一个事件来等待预热完成
-                        warmup_done_event = asyncio.Event()
-                        original_callback = self.session.on_response_done
-                        
-                        # 临时替换回调，只用于等待预热完成
-                        async def warmup_callback():
-                            warmup_done_event.set()
-                        
-                        self.session.on_response_done = warmup_callback
-                        
-                        await self.session.create_response("", skipped=True)
-                        
-                        # 等待预热完成（最多5秒）
-                        try:
-                            await asyncio.wait_for(warmup_done_event.wait(), timeout=5.0)
-                            warmup_time = time.time() - warmup_start
-                            logger.info(f"✅ Session预热完成 (耗时: {warmup_time:.2f}秒)，首轮对话延迟已优化")
-                        except asyncio.TimeoutError:
-                            logger.warning(f"⚠️ Session预热超时（5秒），继续执行...")
-                        
-                        # 恢复原始回调
-                        self.session.on_response_done = original_callback
-                        
-                    except Exception as e:
-                        logger.warning(f"⚠️ Session预热失败（不影响正常使用）: {e}")
+                # 🔥 预热逻辑
+                pass
                 
                 # 启动成功，重置失败计数器
                 self.session_start_failure_count = 0
@@ -790,11 +725,7 @@ class LLMSessionManager:
             # 检查是否是memory_server连接错误（端口48912）
             error_str = str(e)
             if 'WinError 10061' in error_str or 'WinError 10054' in error_str:
-                # 检查端口号是否为48912
-                if str(self.memory_server_port) in error_str or '48912' in error_str:
-                    await self.send_status(f"💥 记忆服务器(端口{self.memory_server_port})已崩溃。请检查API设置是否正确。")
-                else:
-                    await self.send_status("💥 服务器连接被拒绝。请检查API Key和网络连接。")
+                await self.send_status("💥 服务器连接被拒绝。请检查API Key和网络连接。")
             elif '401' in error_str:
                 await self.send_status("💥 API Key被服务器拒绝。请检查API Key是否与所选模型匹配。")
             elif '429' in error_str:
@@ -840,36 +771,30 @@ class LLMSessionManager:
             self.model = core_config['CORE_MODEL']
             self.text_model = core_config['CORRECTION_MODEL']
             self.vision_model = core_config['VISION_MODEL']
-            self.core_url = core_config['CORE_URL']
+            self.vcp_url = core_config['VCP_URL']
             self.core_api_key = core_config['CORE_API_KEY']
-            self.core_api_type = core_config['CORE_API_TYPE']
-            self.openrouter_url = core_config['OPENROUTER_URL']
             self.openrouter_api_key = core_config['OPENROUTER_API_KEY']
             self.audio_api_key = core_config['AUDIO_API_KEY']
             logger.info(f"🔄 热切换准备: 已重新加载配置")
             
             # 创建新的pending session
-            self.pending_session = OmniRealtimeClient(
-                base_url=self.core_url,
-                api_key=self.core_api_key,
-                model=self.model,
+            self.pending_session = OmniOfflineClient(
+                base_url=self.vcp_url,
+                api_key=self.openrouter_api_key,
+                model=self.text_model,
+                vision_model=self.vision_model,
                 on_text_delta=self.handle_text_data,
-                on_audio_delta=self.handle_audio_data,
-                on_new_message=self.handle_new_message,
                 on_input_transcript=self.handle_input_transcript,
                 on_output_transcript=self.handle_output_transcript,
                 on_connection_error=self.handle_connection_error,
                 on_response_done=self.handle_response_complete,
-                api_type=self.core_api_type  # 传入API类型，用于判断是否启用静默超时
             )
             
             initial_prompt = (f"你是一个角色扮演大师，并且精通电脑操作。请按要求扮演以下角色（{self.lanlan_name}），在对方请求时、回答“我试试”并尝试操纵电脑。" if self._is_agent_enabled() else f"你是一个角色扮演大师。请按要求扮演以下角色（{self.lanlan_name}）。") + self.lanlan_prompt
             self.initial_cache_snapshot_len = len(self.message_cache_for_new_session)
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"http://localhost:{self.memory_server_port}/new_dialog/{self.lanlan_name}")
-                initial_prompt += resp.text + self._convert_cache_to_str(self.message_cache_for_new_session)
+            initial_prompt += self._convert_cache_to_str(self.message_cache_for_new_session)
             # print(initial_prompt)
-            await self.pending_session.connect(initial_prompt, native_audio = not self.use_tts)
+            await self.pending_session.connect(initial_prompt)
 
             # 4. Start temporary listener for PENDING session's *first* ignored response
             #    and wait for it to complete.
@@ -1107,25 +1032,6 @@ class LLMSessionManager:
         
         try:
             if input_type == 'text':
-                # 文本模式：检查 session 类型是否正确
-                if not isinstance(self.session, OmniOfflineClient):
-                    # 检查是否允许重建session
-                    if self.session_start_failure_count >= self.session_start_max_failures:
-                        logger.error("💥 Session类型不匹配，但失败次数过多，已停止自动重建")
-                        return
-                    
-                    logger.info(f"文本模式需要 OmniOfflineClient，但当前是 {type(self.session).__name__}. 自动重建 session。")
-                    # 先关闭旧 session
-                    if self.session:
-                        await self.end_session()
-                    # 再创建新的文本模式 session
-                    await self.start_session(self.websocket, new=False, input_mode='text')
-                    
-                    # 检查重建是否成功
-                    if not self.session or not self.is_active or not isinstance(self.session, OmniOfflineClient):
-                        logger.error("💥 文本模式Session重建失败，放弃本次数据流")
-                        return
-                
                 # 文本模式：直接发送文本
                 if isinstance(data, str):
                     # 为每次文本输入生成新的speech_id（用于TTS和lipsync）
@@ -1140,33 +1046,11 @@ class LLMSessionManager:
             
             # Audio输入：只有OmniRealtimeClient能处理
             if input_type == 'audio':
-                # 检查 session 类型
-                if not isinstance(self.session, OmniRealtimeClient):
-                    # 检查是否允许重建session
-                    if self.session_start_failure_count >= self.session_start_max_failures:
-                        logger.error("💥 Session类型不匹配，但失败次数过多，已停止自动重建")
-                        return
-                    
-                    logger.info(f"语音模式需要 OmniRealtimeClient，但当前是 {type(self.session).__name__}. 自动重建 session。")
-                    # 先关闭旧 session
-                    if self.session:
-                        await self.end_session()
-                    # 再创建新的语音模式 session
-                    await self.start_session(self.websocket, new=False, input_mode='audio')
-                    
-                    # 检查重建是否成功
-                    if not self.session or not self.is_active or not isinstance(self.session, OmniRealtimeClient):
-                        logger.error("💥 语音模式Session重建失败，放弃本次数据流")
-                        return
-                
-                # 检查WebSocket连接
-                if not hasattr(self.session, 'ws') or not self.session.ws:
-                    logger.error("💥 Stream: Session websocket not available")
-                    return
                 try:
                     if isinstance(data, list):
                         audio_bytes = struct.pack(f'<{len(data)}h', *data)
-                        await self.session.stream_audio(audio_bytes)
+                        text = transcribe_audio(audio_bytes)
+                        await self.session.stream_text(text)
                     else:
                         logger.error(f"💥 Stream: Invalid audio data type: {type(data)}")
                         return
@@ -1202,15 +1086,6 @@ class LLMSessionManager:
                             # 只添加到待发送队列，等待与文本一起发送
                             await self.session.stream_image(resized_b64)
                         
-                        # 如果是语音模式（OmniRealtimeClient），检查是否支持视觉并直接发送
-                        elif isinstance(self.session, OmniRealtimeClient):
-                            # 检查WebSocket连接
-                            if not hasattr(self.session, 'ws') or not self.session.ws:
-                                logger.error("💥 Stream: Session websocket not available")
-                                return
-                            
-                            # 语音模式直接发送图片
-                            await self.session.stream_image(resized_b64)
                     else:
                         logger.error(f"💥 Stream: Invalid screen data format.")
                         return

@@ -93,52 +93,6 @@ async def _is_duplicate_task(query: str, lanlan_name: Optional[str] = None) -> t
 
 
 # ============ Workers (run in subprocess) ============
-def _worker_processor(task_id: str, query: str, queue: mp.Queue):
-    try:
-        # Lazy import to avoid heavy init in parent
-        from brain.processor import Processor as _Proc
-        import asyncio as _aio
-        proc = _Proc()
-        
-        # Log MCP processing start
-        print(f"[MCP] Starting processor task {task_id} with query: {query[:100]}...")
-        
-        result = _aio.run(proc.process(query))
-        
-        # Log MCP processing result
-        if result.get('can_execute'):
-            server_id = result.get('server_id', 'unknown')
-            reason = result.get('reason', 'no reason provided')
-            tool_calls = result.get('tool_calls', [])
-            tool_results = result.get('tool_results', [])
-            
-            if tool_calls:
-                tools_info = ", ".join([f"'{tool}'" for tool in tool_calls])
-                print(f"[MCP] ✅ Task {task_id} executed successfully using MCP server '{server_id}' with tools: {tools_info}")
-                
-                # Log tool execution results
-                for tool_result in tool_results:
-                    tool_name = tool_result.get('tool', 'unknown')
-                    if tool_result.get('success'):
-                        result_text = tool_result.get('result', 'No result')
-                        print(f"[MCP] 🔧 Tool {tool_name} result: {result_text}")
-                    else:
-                        error_text = tool_result.get('error', 'Unknown error')
-                        print(f"[MCP] ❌ Tool {tool_name} failed: {error_text}")
-            else:
-                print(f"[MCP] ✅ Task {task_id} executed successfully using MCP server '{server_id}' (no specific tools called)")
-            
-            print(f"[MCP]   Reason: {reason}")
-        else:
-            reason = result.get('reason', 'no reason provided')
-            print(f"[MCP] ❌ Task {task_id} failed to execute: {reason}")
-        
-        queue.put({"task_id": task_id, "success": True, "result": result})
-    except Exception as e:
-        print(f"[MCP] 💥 Task {task_id} crashed with error: {str(e)}")
-        queue.put({"task_id": task_id, "success": False, "error": str(e)})
-
-
 def _worker_computer_use(task_id: str, instruction: str, screenshot: Optional[bytes], queue: mp.Queue):
     try:
         from brain.computer_use import ComputerUseAdapter as _CU
@@ -174,16 +128,7 @@ def _spawn_task(kind: str, args: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure result queue exists lazily
     if Modules.result_queue is None:
         Modules.result_queue = mp.Queue()
-    if kind == "processor":
-        p = mp.Process(target=_worker_processor, args=(task_id, args.get("query", ""), Modules.result_queue))
-        info["pid"] = None
-        Modules.task_registry[task_id] = info
-        p.daemon = True
-        p.start()
-        info["pid"] = p.pid
-        info["_proc"] = p
-        return info
-    elif kind == "computer_use":
+    if kind == "computer_use":
         # Queue the task for exclusive execution by the scheduler
         info["status"] = "queued"
         info["pid"] = None
@@ -332,20 +277,12 @@ async def _background_analyze_and_plan(messages: list[dict[str, Any]], lanlan_na
                     t.meta["lanlan_name"] = lanlan_name
                 except Exception:
                     pass
-                if t.meta.get("mcp", {}).get("can_execute") and Modules.agent_flags.get("mcp_enabled", False):
-                    for step in t.steps:
-                        dup, matched = await _is_duplicate_task(step, lanlan_name)
-                        if dup:
-                            continue
-                        ti = _spawn_task("processor", {"query": step})
+                cu_dec = t.meta.get("computer_use_decision") or {}
+                if cu_dec.get("use_computer") and Modules.agent_flags.get("computer_use_enabled", False):
+                    dup, matched = await _is_duplicate_task(t.original_query, lanlan_name)
+                    if not dup:
+                        ti = _spawn_task("computer_use", {"instruction": t.original_query, "screenshot": None})
                         ti["lanlan_name"] = lanlan_name
-                else:
-                    cu_dec = t.meta.get("computer_use_decision") or {}
-                    if cu_dec.get("use_computer") and Modules.agent_flags.get("computer_use_enabled", False):
-                        dup, matched = await _is_duplicate_task(t.original_query, lanlan_name)
-                        if not dup:
-                            ti = _spawn_task("computer_use", {"instruction": t.original_query, "screenshot": None})
-                            ti["lanlan_name"] = lanlan_name
             except Exception:
                 continue
     except Exception:
@@ -375,31 +312,6 @@ async def health():
     return {"status": "ok", "agent_flags": Modules.agent_flags}
 
 
-# 1) 处理器模块：接受自然语言query，交给MCP client处理
-@app.post("/process")
-async def process_query(payload: Dict[str, Any]):
-    if not Modules.processor:
-        raise HTTPException(503, "Processor not ready")
-    query = (payload or {}).get("query", "").strip()
-    if not query:
-        raise HTTPException(400, "query required")
-    lanlan_name = (payload or {}).get("lanlan_name")
-    
-    # Log MCP processing request
-    logger.info(f"[MCP] Received process request from {lanlan_name}: {query[:100]}...")
-    
-    # Dedup check
-    dup, matched = await _is_duplicate_task(query, lanlan_name)
-    if dup:
-        logger.info(f"[MCP] Duplicate task detected, matched with {matched}")
-        return JSONResponse(content={"success": False, "duplicate": True, "matched_id": matched}, status_code=409)
-    info = _spawn_task("processor", {"query": query})
-    info["lanlan_name"] = lanlan_name
-    
-    logger.info(f"[MCP] Spawned processor task {info['id']} for {lanlan_name}")
-    return {"success": True, "task_id": info["id"], "status": info["status"], "start_time": info["start_time"]}
-
-
 # 2) 规划器模块：预载server能力，评估可执行性，入池并分解步骤
 @app.post("/plan")
 async def plan_task(payload: Dict[str, Any]):
@@ -426,32 +338,19 @@ async def plan_task(payload: Dict[str, Any]):
     except Exception:
         pass
     scheduled = []
-    # If MCP plan executable → schedule steps as processor tasks
-    if task.meta.get("mcp", {}).get("can_execute"):
-        logger.info(f"[MCP] Task {task_id} will be executed by MCP with {len(task.steps)} steps")
-        for step in task.steps:
-            d2, m2 = await _is_duplicate_task(step, lanlan_name)
-            if d2:
-                scheduled.append({"duplicate": True, "matched_id": m2, "query": step})
-                continue
-            ti = _spawn_task("processor", {"query": step})
-            ti["lanlan_name"] = lanlan_name
-            scheduled.append({"task_id": ti["id"], "type": "processor", "start_time": ti["start_time"]})
-            logger.info(f"[MCP] Scheduled processor task {ti['id']} for step: {step[:50]}...")
-    else:
-        # If computer use suggested → schedule one-shot
-        cu_dec = task.meta.get("computer_use_decision") or {}
-        if cu_dec.get("use_computer"):
-            logger.info(f"[MCP] Task {task_id} will be executed by Computer Use")
-            d3, m3 = await _is_duplicate_task(task.original_query, lanlan_name)
-            if d3:
-                scheduled.append({"duplicate": True, "matched_id": m3, "query": task.original_query})
-            else:
-                ti = _spawn_task("computer_use", {"instruction": task.original_query, "screenshot": None})
-                ti["lanlan_name"] = lanlan_name
-                scheduled.append({"task_id": ti["id"], "type": "computer_use", "start_time": ti["start_time"]})
+    # If computer use suggested → schedule one-shot
+    cu_dec = task.meta.get("computer_use_decision") or {}
+    if cu_dec.get("use_computer"):
+        logger.info(f"Task {task_id} will be executed by Computer Use")
+        d3, m3 = await _is_duplicate_task(task.original_query, lanlan_name)
+        if d3:
+            scheduled.append({"duplicate": True, "matched_id": m3, "query": task.original_query})
         else:
-            logger.info(f"[MCP] Task {task_id} cannot be executed by any available method")
+            ti = _spawn_task("computer_use", {"instruction": task.original_query, "screenshot": None})
+            ti["lanlan_name"] = lanlan_name
+            scheduled.append({"task_id": ti["id"], "type": "computer_use", "start_time": ti["start_time"]})
+    else:
+        logger.info(f"Task {task_id} cannot be executed by any available method")
     # Now safe to register this logical task into pool
     try:
         Modules.planner.task_pool[task.id] = task

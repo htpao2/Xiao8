@@ -2,8 +2,8 @@
 """Configuration constants exposed by the config package."""
 
 from config.api import (
+    VCP_URL,
     MAIN_SERVER_PORT,
-    MEMORY_SERVER_PORT,
     MONITOR_SERVER_PORT,
     COMMENTER_SERVER_PORT,
     TOOL_SERVER_PORT,
@@ -189,8 +189,8 @@ __all__ = [
     'TIME_ORIGINAL_TABLE_NAME',
     'TIME_COMPRESSED_TABLE_NAME',
     'MODELS_WITH_EXTRA_BODY',
+    'VCP_URL',
     'MAIN_SERVER_PORT',
-    'MEMORY_SERVER_PORT',
     'MONITOR_SERVER_PORT',
     'COMMENTER_SERVER_PORT',
     'TOOL_SERVER_PORT',

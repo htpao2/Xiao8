@@ -1,292 +1,115 @@
-# -- coding: utf-8 --
-
 import asyncio
 import json
-import time
+import httpx
 import logging
-from typing import Optional, Callable, Dict, Any, Awaitable
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from config import MODELS_WITH_EXTRA_BODY
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+import base64
 
-# Setup logger for this module
 logger = logging.getLogger(__name__)
 
 class OmniOfflineClient:
-    """
-    A client for text-based chat that mimics the interface of OmniRealtimeClient.
-    
-    This class provides a compatible interface with OmniRealtimeClient but uses
-    langchain's ChatOpenAI with OpenAI-compatible API instead of realtime WebSocket,
-    suitable for text-only conversations.
-    
-    Attributes:
-        base_url (str):
-            The base URL for the OpenAI-compatible API (e.g., OPENROUTER_URL).
-        api_key (str):
-            The API key for authentication.
-        model (str):
-            Model to use for chat.
-        llm (ChatOpenAI):
-            Langchain ChatOpenAI client for streaming text generation.
-        on_text_delta (Callable[[str, bool], Awaitable[None]]):
-            Callback for text delta events.
-        on_input_transcript (Callable[[str], Awaitable[None]]):
-            Callback for input transcript events (user messages).
-        on_output_transcript (Callable[[str, bool], Awaitable[None]]):
-            Callback for output transcript events (assistant messages).
-        on_connection_error (Callable[[str], Awaitable[None]]):
-            Callback for connection errors.
-        on_response_done (Callable[[], Awaitable[None]]):
-            Callback when a response is complete.
-    """
-    def __init__(
-        self,
-        base_url: str,
-        api_key: str,
-        model: str = "",
-        vision_model: str = "",
-        voice: str = "",  # Unused for text mode but kept for compatibility
-        turn_detection_mode = None,  # Unused for text mode
-        on_text_delta: Optional[Callable[[str, bool], Awaitable[None]]] = None,
-        on_audio_delta: Optional[Callable[[bytes], Awaitable[None]]] = None,  # Unused
-        on_interrupt: Optional[Callable[[], Awaitable[None]]] = None,  # Unused
-        on_input_transcript: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_output_transcript: Optional[Callable[[str, bool], Awaitable[None]]] = None,
-        on_connection_error: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_response_done: Optional[Callable[[], Awaitable[None]]] = None,
-        extra_event_handlers: Optional[Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]]] = None
-    ):
-        # Use base_url directly without conversion
+    def __init__(self, base_url, api_key, model, vision_model, on_text_delta, on_input_transcript, on_output_transcript, on_connection_error, on_response_done):
         self.base_url = base_url
-        self.api_key = api_key if api_key and api_key != '' else None
+        self.api_key = api_key
         self.model = model
-        self.vision_model = vision_model  # Store vision model for temporary switching
+        self.vision_model = vision_model
         self.on_text_delta = on_text_delta
         self.on_input_transcript = on_input_transcript
         self.on_output_transcript = on_output_transcript
-        self.handle_connection_error = on_connection_error
+        self.on_connection_error = on_connection_error
         self.on_response_done = on_response_done
-        
-        # Initialize langchain ChatOpenAI client
-        self.llm = ChatOpenAI(
-            model=self.model,
-            base_url=self.base_url,
-            api_key=self.api_key,
-            temperature=0.8,
-            streaming=True
-        )
-        
-        # State management
-        self._is_responding = False
         self._conversation_history = []
-        self._instructions = ""
-        self._stream_task = None
-        self._pending_images = []  # Store pending images to send with next text
-        
-    async def connect(self, instructions: str, native_audio=False) -> None:
-        """Initialize the client with system instructions."""
-        self._instructions = instructions
-        # Add system message to conversation history using langchain format
-        self._conversation_history = [
-            SystemMessage(content=instructions)
-        ]
-        logger.info("OmniOfflineClient initialized with instructions")
-    
-    async def send_event(self, event) -> None:
-        """Compatibility method - not used in text mode"""
-        pass
-    
-    async def update_session(self, config: Dict[str, Any]) -> None:
-        """Compatibility method - update instructions if provided"""
-        if "instructions" in config:
-            self._instructions = config["instructions"]
-            # Update system message using langchain format
-            if self._conversation_history and isinstance(self._conversation_history[0], SystemMessage):
-                self._conversation_history[0] = SystemMessage(content=self._instructions)
-    
-    def switch_model(self, new_model: str) -> None:
-        """
-        Temporarily switch to a different model (e.g., vision model).
-        This allows dynamic model switching for vision tasks.
-        """
-        if new_model and new_model != self.model:
-            logger.info(f"Switching model from {self.model} to {new_model}")
-            self.model = new_model
-            # Recreate LLM instance with new model
-            self.llm = ChatOpenAI(
-                model=self.model,
-                base_url=self.base_url,
-                api_key=self.api_key,
-                temperature=0.8,
-                streaming=True,
-                extra_body={"enable_thinking": False} if self.model in MODELS_WITH_EXTRA_BODY else None
-            )
-    
-    async def stream_text(self, text: str) -> None:
-        """
-        Send a text message to the API and stream the response.
-        If there are pending images, temporarily switch to vision model for this turn.
-        Uses langchain ChatOpenAI for streaming.
-        """
-        if not text or not text.strip():
-            # If only images without text, use a default prompt
-            if self._pending_images:
-                text = "请分析这些图片。"
-            else:
-                return
-        
-        # Check if we need to temporarily switch to vision model
-        has_images = len(self._pending_images) > 0
-        original_model = self.model
-        
-        # Prepare user message content
-        if has_images:
-            # Temporarily switch to vision model for this turn
-            if self.vision_model and self.vision_model != self.model:
-                logger.info(f"🖼️ Temporarily switching to vision model: {self.vision_model} (from {self.model})")
-                self.switch_model(self.vision_model)
-            
-            # Multi-modal message: images + text
-            content = []
-            
-            # Add images first
-            for img_b64 in self._pending_images:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{img_b64}"
-                    }
-                })
-            
-            # Add text
-            content.append({
-                "type": "text",
-                "text": text.strip()
-            })
-            
-            user_message = HumanMessage(content=content)
-            logger.info(f"Sending multi-modal message with {len(self._pending_images)} images")
-            
-            # Clear pending images after using them
-            self._pending_images.clear()
-        else:
-            # Text-only message
-            user_message = HumanMessage(content=text.strip())
-        
-        self._conversation_history.append(user_message)
-        
-        # Callback for user input
-        if self.on_input_transcript:
-            await self.on_input_transcript(text.strip())
+        self._is_responding = False
+        self.current_request_task = None
+        self.image_cache = []
+
+    async def connect(self, initial_prompt, **kwargs):
+        self._conversation_history.append(SystemMessage(content=initial_prompt))
+
+    async def close(self):
+        if self.current_request_task:
+            self.current_request_task.cancel()
+        self._conversation_history = []
+
+    async def stream_image(self, image_b64):
+        self.image_cache.append(image_b64)
+
+    async def stream_text(self, text):
+        if self._is_responding:
+            logger.warning("Already responding, ignoring new text stream.")
+            return
+
+        self._is_responding = True
         
         try:
-            self._is_responding = True
+            user_message_content = [{"type": "text", "text": text}]
+            if self.image_cache:
+                for img_b64 in self.image_cache:
+                    user_message_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                    })
+                self.model = self.vision_model
             
-            assistant_message = ""
-            is_first_chunk = True
+            self._conversation_history.append(HumanMessage(content=user_message_content))
+            self.image_cache = []
+
+            messages = [msg.dict() for msg in self._conversation_history]
             
-            # Stream response using langchain
-            async for chunk in self.llm.astream(self._conversation_history):
-                if not self._is_responding:
-                    # Interrupted
-                    break
-                    
-                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            # 兼容旧版langchain
+            for msg in messages:
+                if msg.get('type') == 'human':
+                    msg['role'] = 'user'
+                elif msg.get('type') == 'ai':
+                    msg['role'] = 'assistant'
                 
-                # 只处理非空内容，从源头过滤空文本
-                if content and content.strip():
-                    assistant_message += content
-                    
-                    # 文本模式只调用 on_text_delta，不调用 on_output_transcript
-                    # 这与 OmniRealtimeClient 的行为一致：
-                    # - 文本响应使用 on_text_delta
-                    # - 语音转录使用 on_output_transcript
-                    if self.on_text_delta:
-                        await self.on_text_delta(content, is_first_chunk)
-                    
-                    is_first_chunk = False
-                elif content and not content.strip():
-                    # 记录被过滤的空内容（仅包含空白字符）
-                    logger.debug(f"OmniOfflineClient: 过滤空白内容 - content_repr: {repr(content)[:100]}")
+                # 删除 "type" 键（如果存在），因为它不是 OpenAI API 的一部分
+                msg.pop('type', None)
+
+
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+            }
+
+            full_response = ""
+            is_first_chunk = True
+
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", self.base_url, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        await self.on_connection_error(f"VCP connection failed: {response.status_code} {error_text.decode()}")
+                        return
+
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            line = line[6:]
+                            if line.strip() == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(line)
+                                if chunk['choices'][0]['delta']['content']:
+                                    content = chunk['choices'][0]['delta']['content']
+                                    full_response += content
+                                    await self.on_text_delta(content, is_first_chunk)
+                                    is_first_chunk = False
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to decode JSON chunk: {line}")
+                                continue
             
-            # Add assistant response to history
-            if assistant_message:
-                self._conversation_history.append(AIMessage(content=assistant_message))
-                    
+            self._conversation_history.append(AIMessage(content=full_response))
+            await self.on_response_done()
+
+        except asyncio.CancelledError:
+            logger.info("Text streaming task was cancelled.")
         except Exception as e:
-            error_msg = f"Error in text streaming: {str(e)}"
-            logger.error(error_msg)
-            if self.handle_connection_error:
-                await self.handle_connection_error(error_msg)
+            logger.error(f"Error streaming text: {e}")
+            await self.on_connection_error(str(e))
         finally:
             self._is_responding = False
-            # Call response done callback
-            if self.on_response_done:
-                await self.on_response_done()
-    
-    async def stream_audio(self, audio_chunk: bytes) -> None:
-        """Compatibility method - not used in text mode"""
-        pass
-    
-    async def stream_image(self, image_b64: str) -> None:
-        """
-        Add an image to pending images queue.
-        Images will be sent together with the next text message.
-        """
-        if not image_b64:
-            return
-        
-        # Store base64 image
-        self._pending_images.append(image_b64)
-        logger.info(f"Added image to pending queue (total: {len(self._pending_images)})")
-    
-    def has_pending_images(self) -> bool:
-        """Check if there are pending images waiting to be sent."""
-        return len(self._pending_images) > 0
-    
-    async def create_response(self, instructions: str, skipped: bool = False) -> None:
-        """
-        Process a system message or instruction.
-        For compatibility with OmniRealtimeClient interface.
-        """
-        # Extract actual instruction if it starts with "SYSTEM_MESSAGE | "
-        if instructions.startswith("SYSTEM_MESSAGE | "):
-            instructions = instructions[17:]  # Remove prefix
-        
-        # Add as system message using langchain format
-        if instructions.strip():
-            self._conversation_history.append(SystemMessage(content=instructions))
-    
-    async def cancel_response(self) -> None:
-        """Cancel the current response if possible"""
-        self._is_responding = False
-        # Stop processing new chunks by setting flag
-    
-    async def handle_interruption(self):
-        """Handle user interruption - cancel current response"""
-        if not self._is_responding:
-            return
-        
-        logger.info("Handling text mode interruption")
-        await self.cancel_response()
-    
-    async def handle_messages(self) -> None:
-        """
-        Compatibility method for OmniRealtimeClient interface.
-        In text mode, this is a no-op as we don't have a persistent connection.
-        """
-        # Keep this task alive to match the interface
-        try:
-            while True:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            logger.info("Text mode message handler cancelled")
-    
-    async def close(self) -> None:
-        """Close the client and cleanup resources."""
-        self._is_responding = False
-        self._conversation_history = []
-        self._pending_images.clear()
-        logger.info("OmniOfflineClient closed")
 
+    async def handle_messages(self):
+        # This client doesn't need a separate message handler loop
+        pass

@@ -5,12 +5,12 @@ AUDIO_API_KEY和OPENROUTER_API_KEY的如果留空，则会默认使用CORE_API_K
 如果core_config.json中的coreApiKey被修改，则会在启动时自动覆盖CORE_API_KEY。
 """
 # Constant for servers
+VCP_URL = "http://localhost:6005/v1/chat/completions"
 OPENROUTER_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"#"https://openrouter.ai/api/v1"
 CORE_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"#wss://api.openai.com/v1/realtime
 CORE_MODEL = "qwen3-omni-flash-realtime" #gpt-4o-realtime-preview
 VISION_MODEL = "qwen3-vl-plus-2025-09-23" #gpt-5-chat-latest
 MAIN_SERVER_PORT = 48911
-MEMORY_SERVER_PORT = 48912
 MONITOR_SERVER_PORT = 48913
 COMMENTER_SERVER_PORT = 48914
 CORE_API_KEY = ''
