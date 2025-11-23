@@ -601,6 +601,7 @@ class ConfigManager:
             DEFAULT_TTS_MODEL_PROVIDER,
             DEFAULT_TTS_MODEL_URL,
             DEFAULT_TTS_MODEL_API_KEY,
+            VCP_BASE_URL,
         )
 
         config = {
@@ -608,6 +609,7 @@ class ConfigManager:
             'AUDIO_API_KEY': DEFAULT_AUDIO_API_KEY,
             'OPENROUTER_API_KEY': DEFAULT_OPENROUTER_API_KEY,
             'MCP_ROUTER_API_KEY': DEFAULT_MCP_ROUTER_API_KEY,
+            'VCP_BASE_URL': VCP_BASE_URL,
             'CORE_URL': DEFAULT_CORE_URL,
             'CORE_MODEL': DEFAULT_CORE_MODEL,
             'CORE_API_TYPE': 'qwen',
@@ -680,6 +682,9 @@ class ConfigManager:
 
         if core_cfg.get('mcpToken'):
             config['MCP_ROUTER_API_KEY'] = core_cfg['mcpToken']
+
+        if core_cfg.get('vcpBaseUrl'):
+            config['VCP_BASE_URL'] = core_cfg['vcpBaseUrl']
 
         config['COMPUTER_USE_MODEL_API_KEY'] = config['COMPUTER_USE_GROUND_API_KEY'] = config['ASSIST_API_KEY_GLM']
 

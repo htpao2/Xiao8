@@ -13,7 +13,7 @@ import time
 import pickle
 import aiohttp
 import logging
-from config import MONITOR_SERVER_PORT, MEMORY_SERVER_PORT, COMMENTER_SERVER_PORT, TOOL_SERVER_PORT
+from config import MONITOR_SERVER_PORT, COMMENTER_SERVER_PORT, TOOL_SERVER_PORT
 from datetime import datetime
 import json
 import re
@@ -174,20 +174,8 @@ def sync_connector_process(message_queue, shutdown_event, lanlan_name, sync_serv
                                             {'role': 'assistant', 'content': [{'type': 'text', 'text': text_output_cache}]})
                                 text_output_cache = ''
                                 logger.info(f"[{lanlan_name}] 热重置：聊天历史长度 {len(chat_history)} 条消息")
-                                try:
-                                    async with aiohttp.ClientSession() as session:
-                                        async with session.post(
-                                            f"http://localhost:{MEMORY_SERVER_PORT}/renew/{lanlan_name}",
-                                            json={'input_history': json.dumps(chat_history, indent=2, ensure_ascii=False)},
-                                            timeout=aiohttp.ClientTimeout(total=30.0)
-                                        ) as response:
-                                            result = await response.json()
-                                            if result.get('status') == 'error':
-                                                logger.error(f"[{lanlan_name}] 热重置记忆处理失败: {result.get('message')}")
-                                            else:
-                                                logger.info(f"[{lanlan_name}] 热重置记忆已成功上传到 memory_server")
-                                except Exception as e:
-                                    logger.error(f"[{lanlan_name}] 调用 /renew API 失败: {e}")
+                                # Memory Server is removed.
+                                # TODO: Implement local history handling or call VCP API if needed.
                                 chat_history.clear()
 
                             if message["data"] == 'turn end': # lanlan的消息结束了
@@ -265,20 +253,7 @@ def sync_connector_process(message_queue, shutdown_event, lanlan_name, sync_serv
                                 
                                 # 处理聊天历史
                                 logger.info(f"[{lanlan_name}] 会话结束：开始处理聊天历史，共 {len(chat_history)} 条消息")
-                                try:
-                                    async with aiohttp.ClientSession() as session:
-                                        async with session.post(
-                                            f"http://localhost:{MEMORY_SERVER_PORT}/process/{lanlan_name}",
-                                            json={'input_history': json.dumps(chat_history, indent=2, ensure_ascii=False)},
-                                            timeout=aiohttp.ClientTimeout(total=30.0)
-                                        ) as response:
-                                            result = await response.json()
-                                            if result.get('status') == 'error':
-                                                logger.error(f"[{lanlan_name}] 会话记忆处理失败: {result.get('message')}")
-                                            else:
-                                                logger.info(f"[{lanlan_name}] 会话记忆已成功上传到 memory_server")
-                                except Exception as e:
-                                    logger.error(f"[{lanlan_name}] 调用 /process API 失败: {e}")
+                                # Memory Server is removed.
                                 chat_history.clear()
                         except Exception as e:
                             logger.error(f"[{lanlan_name}] System message error: {e}", exc_info=True)

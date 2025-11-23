@@ -26,7 +26,7 @@ import requests
 import httpx
 import pathlib, wave
 from openai import AsyncOpenAI
-from config import MAIN_SERVER_PORT, MONITOR_SERVER_PORT, MEMORY_SERVER_PORT, MODELS_WITH_EXTRA_BODY, TOOL_SERVER_PORT
+from config import MAIN_SERVER_PORT, MONITOR_SERVER_PORT, MODELS_WITH_EXTRA_BODY, TOOL_SERVER_PORT
 from config.prompts_sys import emotion_analysis_prompt, proactive_chat_prompt
 import glob
 from utils.config_manager import get_config_manager
@@ -597,18 +597,6 @@ async def shutdown_event():
                 sync_process[k].terminate()  # 如果超时，强制终止
     logger.info("同步连接器进程已停止")
     
-    # 向memory_server发送关闭信号
-    try:
-        import requests
-        from config import MEMORY_SERVER_PORT
-        shutdown_url = f"http://localhost:{MEMORY_SERVER_PORT}/shutdown"
-        response = requests.post(shutdown_url, timeout=2)
-        if response.status_code == 200:
-            logger.info("已向memory_server发送关闭信号")
-        else:
-            logger.warning(f"向memory_server发送关闭信号失败，状态码: {response.status_code}")
-    except Exception as e:
-        logger.warning(f"向memory_server发送关闭信号时出错: {e}")
 
 
 @app.websocket("/ws/{lanlan_name}")
@@ -755,14 +743,9 @@ async def proactive_chat(request: Request):
                 "detail": str(e)
             }, status_code=500)
         
-        # 2. 获取new_dialogue prompt
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"http://localhost:{MEMORY_SERVER_PORT}/new_dialog/{lanlan_name}", timeout=5.0)
-                memory_context = resp.text
-        except Exception as e:
-            logger.warning(f"[{lanlan_name}] 获取记忆上下文失败，使用空上下文: {e}")
-            memory_context = ""
+        # 2. 获取new_dialogue prompt (Now handled via VCP or simple memory)
+        memory_context = ""
+        # TODO: Fetch context from VCP or local simple memory if needed
         
         # 3. 构造提示词（使用prompts_sys中的模板）
         system_prompt = proactive_chat_prompt.format(
@@ -1763,19 +1746,6 @@ async def shutdown_server_async():
         # Give a small delay to allow the beacon response to be sent
         await asyncio.sleep(0.5)
         logger.info("正在关闭服务器...")
-        
-        # 向memory_server发送关闭信号
-        try:
-            import requests
-            from config import MEMORY_SERVER_PORT
-            shutdown_url = f"http://localhost:{MEMORY_SERVER_PORT}/shutdown"
-            response = requests.post(shutdown_url, timeout=1)
-            if response.status_code == 200:
-                logger.info("已向memory_server发送关闭信号")
-            else:
-                logger.warning(f"向memory_server发送关闭信号失败，状态码: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"向memory_server发送关闭信号时出错: {e}")
         
         # Signal the server to stop
         current_config = get_start_config()

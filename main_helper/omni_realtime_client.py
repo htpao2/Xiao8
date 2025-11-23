@@ -160,7 +160,7 @@ class OmniRealtimeClient:
 
     async def connect(self, instructions: str, native_audio=True) -> None:
         """Establish WebSocket connection with the Realtime API."""
-        url = f"{self.base_url}?model={self.model}" if self.model != "free-model" else self.base_url
+        url = f"{self.base_url}?model={self.model}" if self.model != "free-model" and self.model else self.base_url
         headers = {
             "Authorization": f"Bearer {self.api_key}"
         } 
