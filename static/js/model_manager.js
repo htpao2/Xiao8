@@ -4642,6 +4642,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 _idlePhysicsSavedState.vrm = true;
             }
             vrmManager.enablePhysics = false;
+            // 冻结 LookAt proxy 的 Euler 拆分：crossfade 期间 proxy 的 quaternion 处于
+            // 两个 clip 的混合过渡中，setFromQuaternion → Euler 可能命中 pitch ≈ ±90°
+            // 万向锁，导致 yaw 爆炸 → 脖子折 90° 甩几圈。把 _applyToLookAt 替换为 no-op
+            // 即可阻断拆分；crossfade 窗口结束后 delete 实例属性，原型方法自动恢复。
+            try {
+                const proxy = vrmManager.currentModel.vrm?.scene?.getObjectByName('lookAtQuaternionProxy');
+                if (proxy && typeof proxy._applyToLookAt === 'function' && !proxy.hasOwnProperty('_applyToLookAt')) {
+                    proxy._applyToLookAt = function() {};
+                }
+            } catch (_) { /* noop */ }
         } else {
             const mmd = window.mmdManager;
             if (!mmd || !mmd.currentModel) return;
@@ -4668,6 +4678,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                     vrmManager.enablePhysics = true;
                 }
                 _idlePhysicsSavedState.vrm = null;
+                // 恢复 LookAt proxy：delete 实例 shadow，原型上的 _applyToLookAt 自动生效
+                try {
+                    const proxy = vrm?.scene?.getObjectByName('lookAtQuaternionProxy');
+                    if (proxy?.hasOwnProperty('_applyToLookAt')) {
+                        delete proxy._applyToLookAt;
+                    }
+                } catch (_) { /* noop */ }
             } else {
                 const mmd = window.mmdManager;
                 const model = mmd?.currentModel;
@@ -4686,8 +4703,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     /**
-     * 新动画已落位后调用：延迟 ~250ms 让 mixer 把新动画的首帧稳定应用到骨架上，
-     * 再对齐物理初始态并恢复。
+     * 新动画已落位后调用：延迟 500ms 让 mixer 把新动画充分应用到骨架上，
+     * 再对齐物理初始态并恢复。余量留足以兼容低帧率和 GC 卡顿。
      */
     function _scheduleRestoreIdlePhysics(type) {
         if (_idlePhysicsRestoreTimers[type]) {
@@ -4696,7 +4713,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         _idlePhysicsRestoreTimers[type] = setTimeout(() => {
             _idlePhysicsRestoreTimers[type] = null;
             _alignAndRestoreIdlePhysics(type);
-        }, 250);
+        }, 500);
     }
 
     /** 停止待机动作轮换 */
